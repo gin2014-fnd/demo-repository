@@ -1,0 +1,715 @@
+version: 2.1
+
+################################
+parameters:
+
+  JDK_VERSION:
+    type: string
+    default: "9"
+  MAVEN_VERSION:
+    type: string
+    default: "3.5.2"
+
+  # FOR DEPLOYMENT
+  USE_TEST_HOST:
+    type: boolean
+    default: false
+  TEST_HOST_IP:
+    type: string
+    default: "xxx.xxx.xxx.xxx"
+
+  # FOR NEXUS
+  REPOSITORY:
+    type: string
+    default: "wiwi-raw-"
+  REPO_TYPE:
+    type: string
+    default: "raw"
+  DIRECTORY:
+    type: string
+    default: "demo"
+  FILENAME:
+    type: string
+    default: "demo-control_api"
+
+  # FOR BASTION
+  USE_BASTION:
+    type: boolean
+    default: false
+  BASTION_LOCAL_PORT:
+    type: string
+    default: "9001"
+  BASTION_TARGET_HOST:
+    type: string
+    default: ""
+  BASTION_TARGET_PORT:
+    type: string
+    default: ""
+  BASTION_HOST:
+    type: string
+    default: "ec2-xxx-xxx-xxx-xxx.ap-northeast-1.compute.amazonaws.com"
+
+################################
+
+orbs:
+  nexus-orb: sonatype/nexus-platform-orb@1.0.25
+  dmz: eddiewebb/dmz@0.0.7
+  aws-cli: circleci/aws-cli@1.3.2
+
+workflows:
+
+  application-build:
+    jobs:
+      - setup:
+          filters:
+            branches:
+              only:
+              - feature/test
+#      - preflight-check:
+#          requires:
+#            - setup
+      - build:
+          requires:
+            - setup
+#            - preflight-check
+      - checkstyle:
+          requires:
+#            - setup
+            - build
+      - detect-secrets:
+          requires:
+#            - build
+            - checkstyle
+      - publish:
+          requires:
+#            - build
+#            - checkstyle
+            - detect-secrets
+#             - approval-publish
+
+  staging-deployment:
+    jobs:
+      - setup:
+          filters:
+            branches:
+              only: develop
+      - download:
+          requires:
+            - setup
+          filters:
+            branches:
+              only: develop
+      - acceptant-test:
+          requires:
+            - download
+          filters:
+            branches:
+              only: develop
+      - deploy:
+          requires:
+            - acceptant-test
+          filters:
+            branches:
+              only: develop
+      - deploy-2:
+          requires:
+            - acceptant-test
+          filters:
+            branches:
+              only: develop
+      - deploy-3:
+          requires:
+            - acceptant-test
+          filters:
+            branches:
+              only: develop
+      - service-check:
+          requires:
+            - deploy
+            - deploy-2
+            - deploy-3
+          filters:
+            branches:
+              only: develop
+      - create-tag:
+          requires:
+            - service-check
+          filters:
+            branches:
+              only: develop
+      - staging-publish:
+          requires:
+            - service-check
+          filters:
+            branches:
+              only: develop
+
+  production-deployment:
+    jobs:
+      - setup:
+          filters:
+            branches:
+              only: main
+      - download:
+          requires:
+            - setup
+          filters:
+            branches:
+              only: main
+      - deploy:
+          requires:
+            - download
+          filters:
+            branches:
+              only: main
+      - deploy-2:
+          requires:
+            - download
+          filters:
+            branches:
+              only: main
+      - deploy-3:
+          requires:
+            - download
+          filters:
+            branches:
+              only: main
+      - service-check:
+          requires:
+            - deploy
+            - deploy-2
+            - deploy-3
+          filters:
+            branches:
+              only: main
+      - create-tag:
+          requires:
+            - service-check
+          filters:
+            branches:
+              only: main
+      - production-publish:
+          requires:
+            - service-check
+          filters:
+            branches:
+              only: main
+executors:
+
+  default:
+    # CircleCI Official Image
+    #   https://circleci.com/docs/ja/2.0/circleci-images/#openjdk
+    # OpenJDK Official Image
+    #   htps://hub.docker.com/_/openjdk?tab=description&page=1&ordering=last_updated
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx3g"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2"
+      JDK_VERSION: << pipeline.parameters.JDK_VERSION >>
+      MAVEN_VERSION: << pipeline.parameters.MAVEN_VERSION >>
+      REPOSITORY: << pipeline.parameters.REPOSITORY >>
+      REPO_TYPE: << pipeline.parameters.REPO_TYPE >>
+      DIRECTORY: << pipeline.parameters.DIRECTORY >>
+      FILENAME: << pipeline.parameters.FILENAME >>
+      BASTION_LOCAL_PORT: << pipeline.parameters.BASTION_LOCAL_PORT >>
+      BASTION_TARGET_HOST: << pipeline.parameters.BASTION_TARGET_HOST >>
+      BASTION_TARGET_PORT: << pipeline.parameters.BASTION_TARGET_PORT >>
+      # ec2-xxx-xxx-xxx-xxx.ap-northeast-1.compute.amazonaws.com
+      BASTION_HOST: << pipeline.parameters.BASTION_HOST >>
+    docker:
+      - image: openjdk:${JDK_VERSION}
+
+  detect-secrets-machine:
+    environment:
+     - TZ: "/usr/share/zoneinfo/Asia/Tokyo"
+    docker:
+      - image: circleci/python:3.8.9
+
+  ansible-machine:
+    environment:
+     - TZ: "/usr/share/zoneinfo/Asia/Tokyo"
+    docker:
+      - image: circleci/python:3.8.9
+
+commands:
+  create_tag:
+    steps:
+      - add_ssh_keys:
+          fingerprints:
+            - "69:2e:f6:71:4f:bf:0a:78:82:5e:ad:47:01:9e:51:4f"
+      - run:
+          name: Create Tag2
+          command: |
+            DATE=$(date +%Y%m%d)
+            git tag develop2-${DATE}
+            git push origin develop2-${DATE}
+
+  download_artifact:
+    steps:
+      - run:
+          name: Download
+          command: |
+            bash -c 'apt-get update -y && apt-get install -y jq'
+            downloadUrl=$(curl -sS -u ${NEXUS_RM_USERNAME}:${NEXUS_RM_PASSWORD} 'https://nexus-oss.itsw-ws-01.net/service/rest/v1/search/assets?repository=wiwi-raw-develop&group=/demo&name=demo/*&sort=name&direction=desc' | jq -r 'select(length>0)|.[][0].downloadUrl' | sed 's/null//')
+            echo ${downloadUrl}
+            curl -u ${NEXUS_RM_USERNAME}:${NEXUS_RM_PASSWORD} -O ${downloadUrl}
+            tar xvf demo-control_api*.tar.gz
+            cp target/*.jar .
+      - run:
+          name: Confirm
+          command: |
+            pwd
+            ls -tlr
+
+  deployment_artifact:
+    steps:
+      - run:
+          name: Install ansible
+          command: |
+            sudo pip --version
+            sudo pip install --upgrade pip
+            sudo pip --version
+            sudo pip install ansible
+      - run:
+          name: Deployment
+          command: |
+            #cd ansible/ 
+            ANSIBLE_HOST_KEY_CHECKING=False
+            ansible-playbook -i hosts deploy.yml --extra-vars "aws_access_key=${AWS_ACCESS_KEY} aws_secret_key=${AWS_SECRET_KEY}"
+
+  authorize-security-group-ingress:
+    steps:
+      - run:
+          name: Authorize Security Group Ingress
+          command: |
+            aws --version
+            aws configure set aws_access_key_id "${AWS_ACCESS_KEY}"
+            aws configure set aws_secret_access_key "${AWS_SECRET_KEY}"
+            aws configure set region "${AWS_DEFAULT_REGION}"
+            public_ip_address=$(wget -qO- http://checkip.amazonaws.com)
+            echo "this computers public ip address is $public_ip_address"
+            aws ec2 authorize-security-group-ingress --region ${AWS_DEFAULT_REGION} --group-id ${NEXUS_SECURITY_GROUP_ID} --ip-permissions "[{\"IpProtocol\": \"tcp\", \"FromPort\": 443, \"ToPort\": 443, \"IpRanges\": [{\"CidrIp\": \"${public_ip_address}/32\"}]}]"
+
+  authorize-security-group-egress:
+    steps:
+      - run:
+          name: Authorize Security Group Egress
+          command: |
+            aws --version
+            aws configure set aws_access_key_id "${AWS_ACCESS_KEY}"
+            aws configure set aws_secret_access_key "${AWS_SECRET_KEY}"
+            aws configure set region "${AWS_DEFAULT_REGION}"
+            current_security_group=$(aws ec2 describe-security-groups --region ${AWS_DEFAULT_REGION} --group-id ${NEXUS_SECURITY_GROUP_ID})
+            ip_count=$(echo ${current_security_group} | jq -r '.SecurityGroups[0].IpPermissions | length')
+            if [ ${ip_count} > 0 ]; then
+              for (( n=0; n < $ip_count; n++ ))
+              do
+                this_port=$(echo ${current_security_group} | jq -r ".SecurityGroups[0].IpPermissions[${n}].FromPort")
+                cidr_count=$(echo ${current_security_group} | jq -r ".SecurityGroups[0].IpPermissions[${n}].IpRanges | length")
+                echo "----"
+                echo ${this_port}
+                echo ${cidr_count}
+                if [ ${this_port} == 443 ]; then
+                  for (( c=0; c < $cidr_count; c++ ))
+                  do
+                    this_cidr=$(echo ${current_security_group} | jq -r ".SecurityGroups[0].IpPermissions[${n}].IpRanges[${c}].CidrIp")
+                    echo ${this_cidr}
+                    aws ec2 revoke-security-group-ingress --region ${AWS_DEFAULT_REGION} --group-id ${NEXUS_SECURITY_GROUP_ID} --protocol tcp --port ${this_port} --cidr ${this_cidr}
+                  done
+                fi
+              done
+            fi
+
+jobs:
+
+  setup:
+    executor:
+      #name: ansible-machine
+      name: default
+    working_directory: ~
+    steps:
+      - checkout
+
+      #- aws-cli/install
+      #- authorize-security-group-egress
+      #- authorize-security-group-ingress
+
+      #- deployment_artifact
+      #- download_artifact
+
+      #- create_tag
+
+      - run:
+          name: Get Version
+          command: |
+            bash -c 'apt-get update -y && apt-get install -y libxml2-utils jq'
+            echo "xmllint --xpath '/*[local-name()=\"'\$1'\"]/*[local-name()=\"'\$2'\"]/text()' \$3" > .wxmllint.sh
+            chmod +x .wxmllint.sh
+            echo "export VERSION=$(./.wxmllint.sh project version pom.xml)" >> .env
+            cp /usr/bin/jq .
+      - run:
+          name: Create Report folder
+          command: |
+            mkdir -p build/reports/
+      - run:
+          name: Install Maven
+          command: |
+            source .env
+            curl -OL https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz
+            tar -xzvf apache-maven-${MAVEN_VERSION}-bin.tar.gz
+
+#      - run:
+#          name: Check Paramerter
+#          command: |
+#            curl -v \
+#              -H "Accept: application/vnd.github.v3+json" \
+#              -H "Authorization: token ${GITHUB_ACCESS_TOKEN}" \
+#              "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls?sort=updated&direction=desc"
+#            pulls=$(curl \
+#              -H "Accept: application/vnd.github.v3+json" \
+#              -H "Authorization: token ${GITHUB_ACCESS_TOKEN}" \
+#              "https://api.github.com/repos/${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}/pulls?state=open&sort=updated&direction=desc")
+#            echo ${pulls} | jq -r .[].body
+
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  preflight-check:
+    executor:
+      name: danger-machine
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Setup
+          command: |
+            echo "export IGNORE=$([[ "$IGNORE_LIST" == *"preflight"* ]] && echo '' || echo '--fail-on-errors=true')" >> $BASH_ENV
+      - run:
+          name: Run Danger
+          command: |
+            gem install danger danger-checkstyle_format
+            danger --dangerfile="config/preflight/Dangerfile" --danger_id=preflight-check $IGNORE
+
+  build:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Build 
+          command: |
+            source .env
+            PATH=$PATH:$(pwd)/apache-maven-${MAVEN_VERSION}/bin
+            ### OMD
+            #mvn pmd:pmd
+
+            ### OpenCover
+            mvn clean clover:setup test clover:aggregate clover:clover
+            
+            ### JUnit
+            #mvn test install -Dmaven.test.failure.ignore=true
+            #mvn test install -Dtest=!wiwi.control_api.democontrol_api.FirstTest
+
+            ### Spotbugs
+#            excludeFilter=' \
+#            <Class name="wiwi.control_api.democontrol_api.Quote" /> \
+#            '
+#            excludeFilter=' \
+#            <Class name="" /> \
+#            '
+#            sed -i "s#<Condition>#${excludeFilter}#g" excludeFilter.xml
+#            ls -tlr 
+#            cat excludeFilter.xml
+#            mvn clean install spotbugs:check -Dspotbugs.failOnError=true
+#            #mvn site
+
+#      - store_test_results:
+#          path: target/surefire-reports
+
+      - run:
+          name: Test
+          command: |
+            ls -tlr 
+            ls -ltr target/
+
+#      - store_artifacts:
+#          path: target/
+#          destination: .
+
+      - store_artifacts:
+          path: .pipelines/index.html
+          destination: index.html
+
+      - store_artifacts:
+          path: target/site/clover
+          destination: clover
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+
+  checkstyle:
+    executor:
+      name: default
+    environment:
+      REVIEWDOG_VERSION: 0.9.12
+      REVIEWDOG_GITHUB_API_TOKEN: $REVIEWDOG_GITHUB_API_TOKEN2
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install reviewdog
+          command: |
+              curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh | sh -s
+      - run:
+          name: Setup
+          command: |
+            echo "export IGNORE=$([[ "$IGNORE_LIST" == *"checkstyle"* ]] && echo 'false' || echo 'true')" >> $BASH_ENV
+      - run:
+          name: Execute Checkstyle
+          command: |
+            source .env
+            PATH=$PATH:$(pwd)/apache-maven-${MAVEN_VERSION}/bin
+
+            mvn -X checkstyle:check
+            #mvn -X checkstyle:checkstyle \
+            #  -Dcheckstyle.excludes=**/democontrol_api/*,**/democontrol_api/model/*,
+
+      - store_artifacts:
+          path: target/checkstyle-result.xml
+          destination: checkstyle
+          when: always
+      - run:
+          name: Run reviewdog
+          command: |
+              export REVIEWDOG_GITHUB_API_TOKEN=${REVIEWDOG_GITHUB_API_TOKEN2}
+              cat target/checkstyle-result.xml | ./bin/reviewdog -f=checkstyle -reporter=github-pr-review -fail-on-error=$IGNORE
+          when: always
+
+  detect-secrets:
+    executor:
+      name: detect-secrets-machine
+    environment:
+      DETECT_SECRETS_VERSION: 0.9.12
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install detect-secrets
+          command: |
+              python3 -m pip install detect-secrets
+      - run:
+          name: Execute detect-secrets
+          command: |
+            mkdir -p build/reports/detect-secrets
+
+            detect-secrets scan \
+              --no-verify \
+              --exclude-files src/main/java/democontrol_api/*,java \
+              --exclude-files src/main/resources/application.properties \
+              > build/reports/detect-secrets/detect-secrets-result.json
+
+            cp .pipelines/detect-secrets/index.html build/reports/detect-secrets/index.html
+
+      - store_artifacts:
+          path: build/reports/detect-secrets/
+          destination: detect-secrets
+          when: always
+
+      - run:
+          name: PR Comment
+          command: |
+            curl -sS https://gist.githubusercontent.com/itsw0006/6686dc27dc0c3bfda9aeab234dc8f35c/raw/943402a974c6c1e16db22b973f5f68e83609e638/gistfile1.txt| bash
+
+  publish:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Setup
+          command: |
+            source .env
+            tar -zcvf demo-control_api.tar.gz target/
+            echo 'export REPOSITORY="wiwi-raw-develop" ' >> $BASH_ENV
+            echo 'export REPO_TYPE="raw" ' >> $BASH_ENV
+            echo 'export NEXUS_RM_FILENAME="'$FILENAME'.tar.gz" ' >> $BASH_ENV
+            echo 'export ATTRIBUTES="-Cdirectory='$DIRECTORY' -Afilename='$FILENAME'-v'$VERSION'-num'$(printf '%05d' << pipeline.number>>)'.tar.gz "' >> $BASH_ENV
+#      - dmz/open_tunnel:
+#          local_port: "${BASTION_LOCAL_PORT}"
+#          target_host: "${BASTION_TARGET_HOST}"
+#          target_port: "${BASTION_TARGET_PORT}"
+#          bastion_user: ec2-user
+#          bastion_host: ${BASTION_HOST}
+#          #bastion_public_key: ${BASTION_PUBLIC_KEY}
+      - nexus-orb/install
+      - nexus-orb/publish:
+          repository: ${REPOSITORY}
+          format: ${REPO_TYPE}
+          filename: "${NEXUS_RM_FILENAME}"
+          attributes: "${ATTRIBUTES}"
+          username: "${NEXUS_RM_USERNAME}"
+          password: "${NEXUS_RM_PASSWORD}"
+          serverurl: "${NEXUS_RM_SERVERURL}"
+
+  staging-publish:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Setup
+          command: |
+            tar -zcvf demo-control_api.tar.gz target/
+      - nexus-orb/install
+      - run:
+          name: env
+          command: |
+            source .env
+            echo 'export NEXUS_RM_FILENAME="demo-control_api.tar.gz" ' >> $BASH_ENV
+            echo 'export ATTRIBUTES="-Cdirectory='$DIRECTORY' -Afilename='$FILENAME'-v'$VERSION'.tar.gz "' >> $BASH_ENV
+      - nexus-orb/publish:
+          repository: "wiwi-raw-staging"
+          format: "raw"
+          filename: "${NEXUS_RM_FILENAME}"
+          attributes: "${ATTRIBUTES}"
+          username: "${NEXUS_RM_USERNAME}"
+          password: "${NEXUS_RM_PASSWORD}"
+          serverurl: "${NEXUS_RM_SERVERURL}"
+
+  production-publish:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Setup
+          command: |
+            tar -zcvf demo-control_api.tar.gz target/
+      - nexus-orb/install
+      - run:
+          name: env
+          command: |
+            source .env
+            echo 'export NEXUS_RM_FILENAME="demo-control_api.tar.gz" ' >> $BASH_ENV
+            echo 'export ATTRIBUTES="-Cdirectory='$DIRECTORY' -Afilename='$FILENAME'-v'$VERSION'.tar.gz "' >> $BASH_ENV
+      - nexus-orb/publish:
+          repository: "wiwi-raw-production"
+          format: "raw"
+          filename: "${NEXUS_RM_FILENAME}"
+          attributes: "${ATTRIBUTES}"
+          username: "${NEXUS_RM_USERNAME}"
+          password: "${NEXUS_RM_PASSWORD}"
+          serverurl: "${NEXUS_RM_SERVERURL}"
+
+  download:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Setup
+          command: |
+            bash -c 'apt-get update -y && apt-get install -y jq'
+            downloadUrl=$(curl -sS -u ${NEXUS_RM_USERNAME}:${NEXUS_RM_PASSWORD} 'https://nexus-oss.itsw-ws-01.net/service/rest/v1/search/assets?repository=wiwi-raw-develop&group=/demo&name=demo/*&sort=name&direction=desc' | jq -r 'select(length>0)|.[][0].downloadUrl' | sed 's/null//')
+            echo ${downloadUrl}
+            curl -u ${NEXUS_RM_USERNAME}:${NEXUS_RM_PASSWORD} -O ${downloadUrl}
+            tar xvf demo-control_api*.tar.gz
+            cp target/*.jar .
+      - persist_to_workspace:
+          root: ./target
+          paths:
+            - .
+
+  acceptant-test:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: ./target
+      - run:
+          name: Setup
+          command: |
+            echo "acceptant-test"
+
+  deploy:
+    executor:
+      name: ansible-machine
+    parallelism: 1
+    steps:
+      - attach_workspace:
+          at: ./target
+      - run:
+          name: Setup
+          command: |
+            echo "deploy"
+#      - run:
+#          name: Install ansible
+#          command: |
+#            sudo pip --version
+#            sudo pip install --upgrade pip
+#            sudo pip --version
+#            sudo pip install ansible
+#      - run:
+#          name: Deployment
+#          command: |
+#            cd ansible/ 
+#            ANSIBLE_HOST_KEY_CHECKING=False
+#            ansible-playbook -i hosts deploy.yml --extra-vars "aws_access_key=${AWS_ACCESS_KEY} aws_secret_key=${AWS_SECRET_KEY}"
+
+  deploy-2:
+    executor:
+      name: default
+    parallelism: 1
+    steps:
+      - attach_workspace:
+          at: ./target
+      - run:
+          name: Setup
+          command: |
+            echo "deploy-2"
+
+  deploy-3:
+    executor:
+      name: default
+    parallelism: 1
+    steps:
+      - attach_workspace:
+          at: ./target
+      - run:
+          name: Setup
+          command: |
+            echo "deploy-3"
+
+  service-check:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Setup
+          command: |
+            echo "service-check"
+
+  create-tag:
+    executor:
+      name: default
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Create Tag
+          command: |
+            DATE=$(date +%Y%m%d)
+            git tag develop-${DATE}
+            #git push origin develop-${DATE}
